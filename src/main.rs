@@ -102,7 +102,11 @@ async fn _main() -> Result<()> {
     Ok(())
 }
 
-async fn try_handle(chat: &Chat, handle: impl Future<Output = Result<()>>) -> Result<()> {
+async fn try_handle(
+    chat: &Chat,
+    bot: &Bot,
+    handle: impl Future<Output = Result<()>>,
+) -> Result<()> {
     sentry::start_session();
     sentry::configure_scope(|scope| {
         let mut map = BTreeMap::new();
@@ -122,6 +126,9 @@ async fn try_handle(chat: &Chat, handle: impl Future<Output = Result<()>>) -> Re
 
     if let Err(e) = handle.await {
         sentry_anyhow::capture_anyhow(&e);
+        bot.send_message(chat.id, format!("Произошла неизвестная ошибка: {e}"))
+            .await
+            .ok();
     }
 
     sentry::end_session();
@@ -130,7 +137,7 @@ async fn try_handle(chat: &Chat, handle: impl Future<Output = Result<()>>) -> Re
 }
 
 async fn answer_cmd(bot: Bot, msg: Message, cmd: Command, dialogue: MyDialogue) -> Result<()> {
-    try_handle(&msg.chat.clone(), async move {
+    try_handle(&msg.chat, &bot, async {
         match cmd {
             Command::Start => {
                 let args = parse_command(msg.text().context("no text")?, "anoquebot")
@@ -162,7 +169,7 @@ async fn answer_cmd(bot: Bot, msg: Message, cmd: Command, dialogue: MyDialogue) 
 }
 
 async fn send_anon_message(bot: Bot, msg: Message, dialogue: MyDialogue, chat: i64) -> Result<()> {
-    try_handle(&msg.chat.clone(), async move {
+    try_handle(&msg.chat, &bot, async {
         let Some(text) = msg.text() else {
             bot.send_message(
                 msg.chat.id,
@@ -210,7 +217,7 @@ async fn send_anon_message(bot: Bot, msg: Message, dialogue: MyDialogue, chat: i
 }
 
 async fn invalid_command(bot: Bot, msg: Message) -> Result<()> {
-    try_handle(&msg.chat, async move {
+    try_handle(&msg.chat, &bot, async {
         bot.send_message(
             msg.chat.id,
             "Используйте /start, чтобы получить персональную \
