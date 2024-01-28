@@ -1,6 +1,7 @@
-use std::{collections::BTreeMap, future::Future, str::FromStr};
+use std::{collections::BTreeMap, future::Future, str::FromStr, sync::Arc};
 
 use anyhow::{Context, Result};
+use db::Db;
 use sentry::protocol::Value;
 use teloxide::{
     adaptors::{throttle::Limits, Throttle},
@@ -13,6 +14,8 @@ use teloxide::{
 use tracing::*;
 use tracing_subscriber::prelude::*;
 
+mod db;
+
 type Bot = Throttle<teloxide::Bot>;
 
 #[derive(Clone, Default)]
@@ -20,7 +23,7 @@ pub enum State {
     #[default]
     Start,
     WaitMessage {
-        chat: i64,
+        recipient: i64,
     },
 }
 
@@ -89,17 +92,32 @@ async fn _main() -> Result<()> {
                 .filter_command::<Command>()
                 .endpoint(answer_cmd),
         )
-        .branch(dptree::case![State::WaitMessage { chat }].endpoint(send_anon_message))
+        .branch(dptree::case![State::WaitMessage { recipient }].endpoint(send_anon_message))
         .branch(dptree::endpoint(invalid_command));
 
+    let db = Arc::new(Db::new().await?);
+
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![InMemStorage::<State>::new()])
+        .dependencies(dptree::deps![db, InMemStorage::<State>::new()])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
         .await;
 
     Ok(())
+}
+
+async fn get_personal_link(db: &Db, id: i64, invited_by: Option<i64>) -> Result<String> {
+    let link = db.get_user_link(id, invited_by).await?;
+    Ok(format!("https://t.me/anoquebot?start={link}"))
+}
+
+async fn get_your_link(db: &Db, id: i64, invited_by: Option<i64>) -> Result<String> {
+    let personal_link = get_personal_link(db, id, invited_by).await?;
+    Ok(format!(
+        "Ваша персональная ссылка: {personal_link}. Отправьте \
+                    её друзьям, чтобы начать получать анонимные вопросы!",
+    ))
 }
 
 async fn try_handle(
@@ -136,40 +154,59 @@ async fn try_handle(
     Ok(())
 }
 
-async fn answer_cmd(bot: Bot, msg: Message, cmd: Command, dialogue: MyDialogue) -> Result<()> {
+async fn answer_cmd(
+    db: Arc<Db>,
+    bot: Bot,
+    msg: Message,
+    cmd: Command,
+    dialogue: MyDialogue,
+) -> Result<()> {
     try_handle(&msg.chat, &bot, async {
+        let args = parse_command(msg.text().context("no text")?, "anoquebot")
+                    .context("can't parse")?;
+        let (link_present, recipient) = if let Some(link) = args.1.first() {
+            (true, db.user_id_by_link(link).await?)} else {(false, None)};
+        let get_your_link = get_your_link(&db, msg.chat.id.0, recipient).await?;
+
         match cmd {
             Command::Start => {
-                let args = parse_command(msg.text().context("no text")?, "anoquebot")
-                    .context("cant parse")?;
-                if let Some(chat) = args.1.first() {
-                    let chat_id: i64 = chat.parse()?;
-                    bot.send_message(msg.chat.id, "Напишите анонимный вопрос:")
+                if link_present {
+                    if let Some(recipient) = recipient {
+                        bot.send_message(msg.chat.id, "Напишите анонимный вопрос:")
+                            .await?;
+                        dialogue.update(State::WaitMessage { recipient }).await?;
+                    } else {
+                        bot.send_message(
+                            msg.chat.id,
+                            format!("Ссылка недействительна! Попросите автора создать новую ссылку.\n\n{get_your_link}"),
+                        )
                         .await?;
-                    dialogue
-                        .update(State::WaitMessage { chat: chat_id })
-                        .await?;
+                    };
                 } else {
                     bot.send_message(
                         msg.chat.id,
-                        format!(
-                            "Ваша персональная ссылка: https://t.me/anoquebot?start={}. Отправьте \
-                            её друзьям, чтобы начать получать анонимные вопросы!",
-                            msg.chat.id.0
-                        ),
+                        get_your_link
                     )
                     .await?;
                     dialogue.update(State::Start).await?;
                 }
             }
-        }
+        };
         Ok(())
     })
     .await
 }
 
-async fn send_anon_message(bot: Bot, msg: Message, dialogue: MyDialogue, chat: i64) -> Result<()> {
+async fn send_anon_message(
+    db: Arc<Db>,
+    bot: Bot,
+    msg: Message,
+    dialogue: MyDialogue,
+    recipient: i64,
+) -> Result<()> {
     try_handle(&msg.chat, &bot, async {
+        let get_your_link = get_your_link(&db, msg.chat.id.0, Some(recipient)).await?;
+
         let Some(text) = msg.text() else {
             bot.send_message(
                 msg.chat.id,
@@ -182,7 +219,7 @@ async fn send_anon_message(bot: Bot, msg: Message, dialogue: MyDialogue, chat: i
 
         if let Err(e) = bot
             .send_message(
-                ChatId(chat),
+                ChatId(recipient),
                 format!("Вы получили анонимное сообщение:\n\n{text}"),
             )
             .await
@@ -191,7 +228,7 @@ async fn send_anon_message(bot: Bot, msg: Message, dialogue: MyDialogue, chat: i
                 msg.chat.id,
                 format!(
                     "Не удалось отправить сообщение: {e}. \
-            Возможно, получатель заблокировал бота."
+            Возможно, получатель заблокировал бота.\n\n{get_your_link}"
                 ),
             )
             .await?;
@@ -199,12 +236,7 @@ async fn send_anon_message(bot: Bot, msg: Message, dialogue: MyDialogue, chat: i
         } else {
             bot.send_message(
                 msg.chat.id,
-                format!(
-                    "Ваше сообщение успешно отправлено!\n\n\
-            Ваша персональная ссылка: https://t.me/anoquebot?start={}. Отправьте \
-            её друзьям, чтобы начать получать анонимные вопросы!",
-                    msg.chat.id
-                ),
+                format!("Ваше сообщение успешно отправлено!\n\n{get_your_link}",),
             )
             .await?;
         }
@@ -216,12 +248,13 @@ async fn send_anon_message(bot: Bot, msg: Message, dialogue: MyDialogue, chat: i
     .await
 }
 
-async fn invalid_command(bot: Bot, msg: Message) -> Result<()> {
+async fn invalid_command(db: Arc<Db>, bot: Bot, msg: Message) -> Result<()> {
     try_handle(&msg.chat, &bot, async {
+        let get_your_link = get_your_link(&db, msg.chat.id.0, None).await?;
+
         bot.send_message(
             msg.chat.id,
-            "Используйте /start, чтобы получить персональную \
-        ссылку, или перейдите по чей-то ссылке, чтобы отправить автору вопрос.",
+            format!("Чтобы отправить кому-то анонимный вопрос, перейдите по его персональной ссылке.\n\n{get_your_link}"),
         )
         .await?;
         Ok(())

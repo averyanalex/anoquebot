@@ -27,7 +27,7 @@
             alejandra
             black
             poetry
-            sqlx-cli
+            sea-orm-cli
             postgresql
           ])
           ++ [
