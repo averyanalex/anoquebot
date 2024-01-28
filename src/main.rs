@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, future::Future, str::FromStr};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sentry::protocol::Value;
 use teloxide::{
     adaptors::{throttle::Limits, Throttle},
@@ -8,6 +8,7 @@ use teloxide::{
     macros::BotCommands,
     prelude::*,
     types::Chat,
+    utils::command::parse_command,
 };
 use tracing::*;
 use tracing_subscriber::prelude::*;
@@ -28,9 +29,6 @@ type MyDialogue = Dialogue<State, InMemStorage<State>>;
 #[derive(Debug, BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "Доступные команды:")]
 enum Command {
-    #[command(rename = "start")]
-    SendQuestion { chat: i64 },
-    #[command(rename = "start")]
     Start,
 }
 
@@ -132,24 +130,30 @@ async fn try_handle(chat: &Chat, handle: impl Future<Output = Result<()>>) -> Re
 }
 
 async fn answer_cmd(bot: Bot, msg: Message, cmd: Command, dialogue: MyDialogue) -> Result<()> {
-    try_handle(&msg.chat, async move {
+    try_handle(&msg.chat.clone(), async move {
         match cmd {
             Command::Start => {
-                bot.send_message(
-                    msg.chat.id,
-                    format!(
-                        "Ваша персональная ссылка: https://t.me/anoquebot?start={}. Отправьте \
-                        её друзьям, чтобы начать получать анонимные вопросы!",
-                        msg.chat.id.0
-                    ),
-                )
-                .await?;
-                dialogue.update(State::Start).await?;
-            }
-            Command::SendQuestion { chat } => {
-                bot.send_message(msg.chat.id, "Напишите анонимный вопрос:")
+                let args = parse_command(msg.text().context("no text")?, "anoquebot")
+                    .context("cant parse")?;
+                if let Some(chat) = args.1.first() {
+                    let chat_id: i64 = chat.parse()?;
+                    bot.send_message(msg.chat.id, "Напишите анонимный вопрос:")
+                        .await?;
+                    dialogue
+                        .update(State::WaitMessage { chat: chat_id })
+                        .await?;
+                } else {
+                    bot.send_message(
+                        msg.chat.id,
+                        format!(
+                            "Ваша персональная ссылка: https://t.me/anoquebot?start={}. Отправьте \
+                            её друзьям, чтобы начать получать анонимные вопросы!",
+                            msg.chat.id.0
+                        ),
+                    )
                     .await?;
-                dialogue.update(State::WaitMessage { chat }).await?;
+                    dialogue.update(State::Start).await?;
+                }
             }
         }
         Ok(())
