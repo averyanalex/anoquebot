@@ -1,0 +1,15 @@
+[package]
+name = "anoquebot"
+authors = ["Alexander Averyanov <alex@averyan.ru>"]
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+sentry = "0.32.1"
+sentry-anyhow = "0.32.1"
+sentry-tracing = "0.32.1"
+teloxide = { version = "0.12.2", features = ["ctrlc_handler", "throttle", "macros"] }
+tokio = { version = "1.35", features = ["full"] }
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
