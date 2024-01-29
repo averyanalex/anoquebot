@@ -20,7 +20,7 @@
         pkgs = import nixpkgs {inherit system overlays;};
         inherit (import-cargo.builders) importCargo;
 
-        rust = pkgs.rust-bin.stable.latest.default;
+        rust = pkgs.rust-bin.nightly.latest.default;
 
         devInputs =
           (with pkgs; [

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use entities::{prelude::*, users};
+use entities::{messages, prelude::*, users};
 use migration::{Migrator, MigratorTrait};
 use rand::Rng;
 use sea_orm::{prelude::*, ActiveValue, ConnectOptions, Database, DatabaseConnection, EntityTrait};
@@ -35,7 +35,7 @@ impl Db {
             user.link
         } else {
             let link: String = {
-                const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+                const CHARSET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
                 let mut rng = rand::thread_rng();
                 (0..8)
                     .map(|_| {
@@ -47,8 +47,8 @@ impl Db {
 
             let user = users::ActiveModel {
                 id: ActiveValue::Set(id),
-                invited_by: ActiveValue::Set(invited_by),
                 link: ActiveValue::Set(link.clone()),
+                invited_by: ActiveValue::Set(invited_by),
                 ..Default::default()
             };
             Users::insert(user).exec(&self.dc).await?;
@@ -57,6 +57,16 @@ impl Db {
         Ok(link)
     }
 
+    // pub async fn set_invited_by(&self, id: i64, invited_by: i64) -> Result<()> {
+    //     Users::update_many()
+    //         .col_expr(users::Column::InvitedBy, invited_by.into())
+    //         .filter(users::Column::Id.eq(id))
+    //         .filter(users::Column::InvitedBy.is_null())
+    //         .exec(&self.dc)
+    //         .await?;
+    //     Ok(())
+    // }
+
     pub async fn user_id_by_link(&self, link: &str) -> Result<Option<i64>> {
         let id = Users::find()
             .filter(users::Column::Link.eq(link))
@@ -64,5 +74,37 @@ impl Db {
             .await?
             .map(|u| u.id);
         Ok(id)
+    }
+
+    pub async fn save_message(
+        &self,
+        sender_id: i64,
+        sender_message_id: i32,
+        recipient_id: i64,
+        recipient_message_id: i32,
+    ) -> Result<()> {
+        let message = messages::ActiveModel {
+            sender_id: ActiveValue::Set(sender_id),
+            sender_message_id: ActiveValue::Set(sender_message_id),
+            recipient_id: ActiveValue::Set(recipient_id),
+            recipient_message_id: ActiveValue::Set(recipient_message_id),
+            ..Default::default()
+        };
+        Messages::insert(message).exec(&self.dc).await?;
+        Ok(())
+    }
+
+    pub async fn find_message(
+        &self,
+        recipient_id: i64,
+        recipient_message_id: i32,
+    ) -> Result<Option<(i64, i32)>> {
+        let ids = Messages::find()
+            .filter(messages::Column::RecipientId.eq(recipient_id))
+            .filter(messages::Column::RecipientMessageId.eq(recipient_message_id))
+            .one(&self.dc)
+            .await?
+            .map(|m| (m.sender_id, m.sender_message_id));
+        Ok(ids)
     }
 }

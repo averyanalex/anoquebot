@@ -1,14 +1,15 @@
+#![feature(let_chains)]
+
 use std::{collections::BTreeMap, future::Future, str::FromStr, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Result};
 use db::Db;
 use sentry::protocol::Value;
 use teloxide::{
     adaptors::{throttle::Limits, Throttle},
     dispatching::dialogue::InMemStorage,
-    macros::BotCommands,
     prelude::*,
-    types::Chat,
+    types::{Chat, MessageId},
     utils::command::parse_command,
 };
 use tracing::*;
@@ -22,18 +23,13 @@ type Bot = Throttle<teloxide::Bot>;
 pub enum State {
     #[default]
     Start,
-    WaitMessage {
-        recipient: i64,
+    WaitNewMessage {
+        sent_msg: i32,
+        recipient_id: i64,
     },
 }
 
 type MyDialogue = Dialogue<State, InMemStorage<State>>;
-
-#[derive(Debug, BotCommands, Clone)]
-#[command(rename_rule = "lowercase", description = "Доступные команды:")]
-enum Command {
-    Start,
-}
 
 fn main() -> Result<()> {
     std::env::set_var("RUST_BACKTRACE", "1");
@@ -87,13 +83,7 @@ async fn _main() -> Result<()> {
 
     let handler = Update::filter_message()
         .enter_dialogue::<Message, InMemStorage<State>, State>()
-        .branch(
-            dptree::entry()
-                .filter_command::<Command>()
-                .endpoint(answer_cmd),
-        )
-        .branch(dptree::case![State::WaitMessage { recipient }].endpoint(send_anon_message))
-        .branch(dptree::endpoint(invalid_command));
+        .branch(dptree::endpoint(handle_message));
 
     let db = Arc::new(Db::new().await?);
 
@@ -107,17 +97,138 @@ async fn _main() -> Result<()> {
     Ok(())
 }
 
-async fn get_personal_link(db: &Db, id: i64, invited_by: Option<i64>) -> Result<String> {
-    let link = db.get_user_link(id, invited_by).await?;
-    Ok(format!("https://t.me/anoquebot?start={link}"))
+async fn user_link(bot: &Bot, link_code: &str) -> Result<String> {
+    let mut tme_url = bot.get_me().await?.tme_url();
+    tme_url.set_query(Some(&format!("start={link_code}")));
+    Ok(tme_url.to_string())
 }
 
-async fn get_your_link(db: &Db, id: i64, invited_by: Option<i64>) -> Result<String> {
-    let personal_link = get_personal_link(db, id, invited_by).await?;
-    Ok(format!(
-        "Ваша персональная ссылка: {personal_link}. Отправьте \
-                    её друзьям, чтобы начать получать анонимные вопросы!",
-    ))
+async fn reset_dialogue(bot: &Bot, dialogue: &MyDialogue, chat_id: ChatId) -> Result<()> {
+    let state = dialogue.get_or_default().await?;
+    match state {
+        State::Start => {}
+        State::WaitNewMessage {
+            sent_msg,
+            recipient_id: _,
+        } => {
+            bot.delete_message(chat_id, MessageId(sent_msg)).await.ok();
+        }
+    };
+    dialogue.reset().await?;
+    Ok(())
+}
+
+async fn handle_message(db: Arc<Db>, bot: Bot, msg: Message, dialogue: MyDialogue) -> Result<()> {
+    try_handle(&msg.chat, &bot, async {
+        if let Some(text) = msg.text() && let Some(cmd) = parse_command(text, bot.get_me().await?.username()) {
+            match cmd.0 {
+                "start" => {
+                    if let Some(link) = cmd.1.into_iter().next() {
+                        if let Some(recipient_id) = db.user_id_by_link(link).await? {
+                            db.get_user_link(msg.chat.id.0, Some(recipient_id)).await?;
+                            let sent_msg = bot.send_message(msg.chat.id, "Напишите анонимный вопрос:")
+                                .await?;
+                            reset_dialogue(&bot, &dialogue, msg.chat.id).await?;
+                            dialogue.update(State::WaitNewMessage { recipient_id, sent_msg: sent_msg.id.0 }).await?;
+                        } else {
+                            let my_link_code = db.get_user_link(msg.chat.id.0, None).await?;
+                            bot.send_message(
+                                msg.chat.id,
+                                format!("Ссылка недействительна! Попросите автора создать новую ссылку. \
+                                А вот, кстати, ваша собственная ссылка для получения анонимных вопросов и сообщений: {}", user_link(&bot, &my_link_code).await?),
+                            )
+                            .await?;
+                            reset_dialogue(&bot, &dialogue, msg.chat.id).await?;
+                        }
+                    } else {
+                        let my_link_code = db.get_user_link(msg.chat.id.0, None).await?;
+                        bot.send_message(msg.chat.id, format!("Добро пожаловать в бот для полученя анонимных вопросов и сообщений! \
+                        Чтобы начать получать анонимные вопросы, поделитесь своей персональной ссылкой с друзьями: {}", user_link(&bot, &my_link_code).await?)).await?;
+                        reset_dialogue(&bot, &dialogue, msg.chat.id).await?;
+                    }
+                }
+                _ => {
+                    db.get_user_link(msg.chat.id.0, None).await?;
+                    bot.send_message(msg.chat.id, "Неизвестная команда! Попробуйте /start").await?;
+                    reset_dialogue(&bot, &dialogue, msg.chat.id).await?;
+                }
+            }
+        } else {
+            let my_link_code = db.get_user_link(msg.chat.id.0, None).await?;
+            let user_link = user_link(&bot, &my_link_code).await?;
+
+            let state = dialogue.get_or_default().await?;
+
+            let Some(text) = msg.text() else {
+                bot.send_message(msg.chat.id, "На данный момент поддерживаются только текстовые сообщения.").await?;
+                return Ok(())
+            };
+
+            match state {
+                State::Start => {
+                    if let Some(msg_reply_to) = msg.reply_to_message() {
+                        ensure!(msg_reply_to.chat.id == msg.chat.id);
+                        if let Some(reply_for) = db.find_message(msg.chat.id.0, msg_reply_to.id.0).await? {
+                            let sent_msg = bot.send_message(ChatId(reply_for.0), format!("Вы получили ответ ответ (свайпните влево для ответа):\n\n{text}"))
+                                // .parse_mode(ParseMode::MarkdownV2)
+                                .reply_to_message_id(MessageId(reply_for.1))
+                                .await?;
+                            bot.send_message(
+                                msg.chat.id,
+                                "Ваш ответ успешно отправлен!"
+                            )
+                            .await?;
+                            db.save_message(msg.chat.id.0, msg.id.0, sent_msg.chat.id.0, sent_msg.id.0).await?;
+                        } else {
+                            bot.send_message(msg.chat.id, "Отвечать (свайпать слево) можно только на входящие анонимные сообщения").await?;
+                        }
+                    } else {
+                    bot.send_message(msg.chat.id, format!("Кажется, вы отправили сообщение, но мы его не ждали... Может быть, \
+                    вы хотели отправить кому-то сообщение или ответь на полученное? В таком случае перейдите по ссылке друга или свайпните \
+                    полученное сообщение слево. А если вы хотите начать получать сообщения сами, то держите ссылку: {user_link}")).await?;
+                    }
+                },
+                State::WaitNewMessage { recipient_id, sent_msg: _ } => {
+                    if msg.reply_to_message().is_some() {
+                        bot.send_message(msg.chat.id, "Для отправки анонимного вопроса не нужно свайпать сообщения влево (отвечать). \
+                        Попробуйте ещё раз.").await?;
+                    } else {
+                        match bot.send_message(
+                            ChatId(recipient_id),
+                            format!("Вы получили сообщение (свайпните влево для ответа):\n\n{text}"),
+                        )
+                        // .parse_mode(ParseMode::MarkdownV2)
+                        .await {
+                            Ok(sent_msg) => {
+                                bot.send_message(
+                                    msg.chat.id,
+                                    format!("Ваше сообщение успешно отправлено! А вот, кстати, ваша \
+                                    собственная ссылка для получения анонимных вопросов и сообщений: {user_link}",),
+                                )
+                                .await?;
+                                db.save_message(msg.chat.id.0, msg.id.0, recipient_id, sent_msg.id.0).await?;
+                            },
+                            Err(e) => {
+                                bot.send_message(
+                                    msg.chat.id,
+                                    format!(
+                                        "Не удалось отправить сообщение: {e}. \
+                                Возможно, получатель заблокировал бота. А вот, кстати, ваша \
+                                собственная ссылка для получения анонимных вопросов и сообщений: {user_link}"
+                                        ),
+                                    )
+                                    .await?;
+                                sentry::capture_error(&e);
+                            },
+                        };
+                        dialogue.reset().await?;
+                    }
+                }
+            }
+        };
+        Ok(())
+    })
+    .await
 }
 
 async fn try_handle(
@@ -152,112 +263,4 @@ async fn try_handle(
     sentry::end_session();
 
     Ok(())
-}
-
-async fn answer_cmd(
-    db: Arc<Db>,
-    bot: Bot,
-    msg: Message,
-    cmd: Command,
-    dialogue: MyDialogue,
-) -> Result<()> {
-    try_handle(&msg.chat, &bot, async {
-        let args = parse_command(msg.text().context("no text")?, "anoquebot")
-                    .context("can't parse")?;
-        let (link_present, recipient) = if let Some(link) = args.1.first() {
-            (true, db.user_id_by_link(link).await?)} else {(false, None)};
-        let get_your_link = get_your_link(&db, msg.chat.id.0, recipient).await?;
-
-        match cmd {
-            Command::Start => {
-                if link_present {
-                    if let Some(recipient) = recipient {
-                        bot.send_message(msg.chat.id, "Напишите анонимный вопрос:")
-                            .await?;
-                        dialogue.update(State::WaitMessage { recipient }).await?;
-                    } else {
-                        bot.send_message(
-                            msg.chat.id,
-                            format!("Ссылка недействительна! Попросите автора создать новую ссылку.\n\n{get_your_link}"),
-                        )
-                        .await?;
-                    };
-                } else {
-                    bot.send_message(
-                        msg.chat.id,
-                        get_your_link
-                    )
-                    .await?;
-                    dialogue.update(State::Start).await?;
-                }
-            }
-        };
-        Ok(())
-    })
-    .await
-}
-
-async fn send_anon_message(
-    db: Arc<Db>,
-    bot: Bot,
-    msg: Message,
-    dialogue: MyDialogue,
-    recipient: i64,
-) -> Result<()> {
-    try_handle(&msg.chat, &bot, async {
-        let get_your_link = get_your_link(&db, msg.chat.id.0, Some(recipient)).await?;
-
-        let Some(text) = msg.text() else {
-            bot.send_message(
-                msg.chat.id,
-                "В вашем сообщении нет текста! \
-            Изображения на данный момент не поддерживаются. Попробуйте ещё раз.",
-            )
-            .await?;
-            return Ok(());
-        };
-
-        if let Err(e) = bot
-            .send_message(
-                ChatId(recipient),
-                format!("Вы получили анонимное сообщение:\n\n{text}"),
-            )
-            .await
-        {
-            bot.send_message(
-                msg.chat.id,
-                format!(
-                    "Не удалось отправить сообщение: {e}. \
-            Возможно, получатель заблокировал бота.\n\n{get_your_link}"
-                ),
-            )
-            .await?;
-            sentry::capture_error(&e);
-        } else {
-            bot.send_message(
-                msg.chat.id,
-                format!("Ваше сообщение успешно отправлено!\n\n{get_your_link}",),
-            )
-            .await?;
-        }
-
-        dialogue.update(State::Start).await?;
-
-        Ok(())
-    })
-    .await
-}
-
-async fn invalid_command(db: Arc<Db>, bot: Bot, msg: Message) -> Result<()> {
-    try_handle(&msg.chat, &bot, async {
-        let get_your_link = get_your_link(&db, msg.chat.id.0, None).await?;
-
-        bot.send_message(
-            msg.chat.id,
-            format!("Чтобы отправить кому-то анонимный вопрос, перейдите по его персональной ссылке.\n\n{get_your_link}"),
-        )
-        .await?;
-        Ok(())
-    })
-    .await
 }

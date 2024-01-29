@@ -16,10 +16,7 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .primary_key(),
                     )
-                    .col(
-                        ColumnDef::new(Users::InvitedBy)
-                            .big_integer(),
-                    )
+                    .col(ColumnDef::new(Users::InvitedBy).big_integer())
                     .col(
                         ColumnDef::new(Users::LastActivity)
                             .date_time()
@@ -40,7 +37,7 @@ impl MigrationTrait for Migration {
 }
 
 #[derive(DeriveIden)]
-enum Users {
+pub enum Users {
     Table,
     Id,
     InvitedBy,
