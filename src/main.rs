@@ -190,8 +190,8 @@ async fn handle_message(db: Arc<Db>, bot: Bot, msg: Message, dialogue: MyDialogu
                 },
                 State::WaitNewMessage { recipient_id, sent_msg: _ } => {
                     if msg.reply_to_message().is_some() {
-                        bot.send_message(msg.chat.id, "Для отправки анонимного вопроса не нужно свайпать сообщения влево (отвечать). \
-                        Попробуйте ещё раз.").await?;
+                        bot.send_message(msg.chat.id, "Для отправки анонимного вопроса не нужно свайпать сообщение влево (отвечать).").await?;
+                        dialogue.reset().await?;
                     } else {
                         match bot.send_message(
                             ChatId(recipient_id),
