@@ -169,7 +169,7 @@ async fn handle_message(db: Arc<Db>, bot: Bot, msg: Message, dialogue: MyDialogu
                     if let Some(msg_reply_to) = msg.reply_to_message() {
                         ensure!(msg_reply_to.chat.id == msg.chat.id);
                         if let Some(reply_for) = db.find_message(msg.chat.id.0, msg_reply_to.id.0).await? {
-                            let sent_msg = bot.send_message(ChatId(reply_for.0), format!("Вы получили ответ ответ (свайпните влево для ответа):\n\n{text}"))
+                            let sent_msg = bot.send_message(ChatId(reply_for.0), format!("Вы получили ответ (свайпните влево для ответа):\n\n{text}"))
                                 // .parse_mode(ParseMode::MarkdownV2)
                                 .reply_to_message_id(MessageId(reply_for.1))
                                 .await?;
