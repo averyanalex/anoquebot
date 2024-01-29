@@ -43,4 +43,5 @@ pub enum Users {
     InvitedBy,
     Link,
     LastActivity,
+    FirstActivity,
 }

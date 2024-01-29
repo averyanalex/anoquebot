@@ -11,6 +11,7 @@ pub struct Model {
     pub sender_message_id: i32,
     pub recipient_id: i64,
     pub recipient_message_id: i32,
+    pub timestamp: DateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

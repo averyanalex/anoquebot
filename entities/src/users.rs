@@ -11,6 +11,7 @@ pub struct Model {
     pub last_activity: DateTime,
     #[sea_orm(unique)]
     pub link: String,
+    pub first_activity: DateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

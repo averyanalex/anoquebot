@@ -58,11 +58,12 @@ impl MigrationTrait for Migration {
 }
 
 #[derive(DeriveIden)]
-enum Messages {
+pub enum Messages {
     Table,
     Id,
     SenderId,
     SenderMessageId,
     RecipientId,
     RecipientMessageId,
+    Timestamp,
 }
