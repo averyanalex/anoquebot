@@ -9,7 +9,7 @@ use teloxide::{
     adaptors::{throttle::Limits, Throttle},
     dispatching::dialogue::InMemStorage,
     prelude::*,
-    types::{Chat, MessageId},
+    types::{Chat, InputFile, MessageId},
     utils::command::parse_command,
 };
 use tracing::*;
@@ -118,6 +118,71 @@ async fn reset_dialogue(bot: &Bot, dialogue: &MyDialogue, chat_id: ChatId) -> Re
     Ok(())
 }
 
+async fn forward_message(
+    bot: &Bot,
+    msg: &Message,
+    recipient: ChatId,
+    reply_for: Option<MessageId>,
+) -> Result<Option<Message>> {
+    macro_rules! prepare_msg {
+        ($req:ident) => {
+            if let Some(reply_for) = reply_for {
+                $req = $req.reply_to_message_id(reply_for);
+            }
+
+            if let Some(caption) = msg.caption() {
+                $req = $req.caption(format!("Вы получили сообщение (свайпните влево для ответа):\n\n{caption}"));
+            } else {
+                $req = $req.caption("Вы получили сообщение (свайпните влево для ответа)");
+            }
+        };
+    }
+
+    let sent_msg = if let Some([.., photo]) = msg.photo() {
+        let mut r = bot.send_photo(recipient, InputFile::file_id(&photo.file.id));
+        prepare_msg!(r);
+        r.await?
+    } else if let Some(video) = msg.video() {
+        let mut r = bot.send_video(recipient, InputFile::file_id(&video.file.id));
+        prepare_msg!(r);
+        r.await?
+    } else if let Some(audio) = msg.audio() {
+        let mut r = bot.send_audio(recipient, InputFile::file_id(&audio.file.id));
+        prepare_msg!(r);
+        r.await?
+    } else if let Some(document) = msg.document() {
+        let mut r = bot.send_document(recipient, InputFile::file_id(&document.file.id));
+        prepare_msg!(r);
+        r.await?
+    } else if let Some(voice) = msg.voice() {
+        let mut r = bot.send_voice(recipient, InputFile::file_id(&voice.file.id));
+        prepare_msg!(r);
+        r.await?
+    } else if let Some(video_note) = msg.video_note() {
+        let mut r = bot.send_voice(recipient, InputFile::file_id(&video_note.file.id));
+        prepare_msg!(r);
+        r.await?
+    } else if let Some(text) = msg.text() {
+        let mut r = bot.send_message(
+            recipient,
+            format!("Вы получили сообщение (свайпните влево для ответа):\n\n{text}"),
+        );
+        if let Some(reply_for) = reply_for {
+            r = r.reply_to_message_id(reply_for);
+        }
+        r.await?
+    } else {
+        bot.send_message(
+            msg.chat.id,
+            "Поддерживаются только текст, фото, видео, аудио, файлы, кружочки и голосовые.",
+        )
+        .await?;
+        return Ok(None);
+    };
+
+    Ok(Some(sent_msg))
+}
+
 async fn handle_message(db: Arc<Db>, bot: Bot, msg: Message, dialogue: MyDialogue) -> Result<()> {
     try_handle(&msg.chat, &bot, async {
         if let Some(text) = msg.text() && let Some(cmd) = parse_command(text, bot.get_me().await?.username()) {
@@ -126,7 +191,8 @@ async fn handle_message(db: Arc<Db>, bot: Bot, msg: Message, dialogue: MyDialogu
                     if let Some(link) = cmd.1.into_iter().next() {
                         if let Some(recipient_id) = db.user_id_by_link(link).await? {
                             db.get_user_link(msg.chat.id.0, Some(recipient_id)).await?;
-                            let sent_msg = bot.send_message(msg.chat.id, "Напишите анонимный вопрос:")
+                            let sent_msg = bot.send_message(msg.chat.id, "Отправьте ваше анонимное сообщение \
+                            (текст, фото, видео, аудио, файл, кружочек или голосовое):")
                                 .await?;
                             reset_dialogue(&bot, &dialogue, msg.chat.id).await?;
                             dialogue.update(State::WaitNewMessage { recipient_id, sent_msg: sent_msg.id.0 }).await?;
@@ -143,7 +209,8 @@ async fn handle_message(db: Arc<Db>, bot: Bot, msg: Message, dialogue: MyDialogu
                     } else {
                         let my_link_code = db.get_user_link(msg.chat.id.0, None).await?;
                         bot.send_message(msg.chat.id, format!("Добро пожаловать в бот для полученя анонимных вопросов и сообщений! \
-                        Чтобы начать получать анонимные вопросы, поделитесь своей персональной ссылкой с друзьями: {}", user_link(&bot, &my_link_code).await?)).await?;
+                        Чтобы начать получать анонимные вопросы, поделитесь своей персональной ссылкой с друзьями: {}. Возможна отправка текста, фото, аудио, \
+                        видео, файлов, кружочков и голосовых.", user_link(&bot, &my_link_code).await?)).await?;
                         reset_dialogue(&bot, &dialogue, msg.chat.id).await?;
                     }
                 }
@@ -159,26 +226,19 @@ async fn handle_message(db: Arc<Db>, bot: Bot, msg: Message, dialogue: MyDialogu
 
             let state = dialogue.get_or_default().await?;
 
-            let Some(text) = msg.text() else {
-                bot.send_message(msg.chat.id, "На данный момент поддерживаются только текстовые сообщения.").await?;
-                return Ok(())
-            };
-
             match state {
                 State::Start => {
                     if let Some(msg_reply_to) = msg.reply_to_message() {
                         ensure!(msg_reply_to.chat.id == msg.chat.id);
                         if let Some(reply_for) = db.find_message(msg.chat.id.0, msg_reply_to.id.0).await? {
-                            let sent_msg = bot.send_message(ChatId(reply_for.0), format!("Вы получили ответ (свайпните влево для ответа):\n\n{text}"))
-                                // .parse_mode(ParseMode::MarkdownV2)
-                                .reply_to_message_id(MessageId(reply_for.1))
+                            if let Some(sent_msg) = forward_message(&bot, &msg, ChatId(reply_for.0), Some(MessageId(reply_for.1))).await? {
+                                bot.send_message(
+                                    msg.chat.id,
+                                    "Ваш ответ отправлен!"
+                                )
                                 .await?;
-                            bot.send_message(
-                                msg.chat.id,
-                                "Ваш ответ успешно отправлен!"
-                            )
-                            .await?;
-                            db.save_message(msg.chat.id.0, msg.id.0, sent_msg.chat.id.0, sent_msg.id.0).await?;
+                                db.save_message(msg.chat.id.0, msg.id.0, sent_msg.chat.id.0, sent_msg.id.0).await?;
+                            }
                         } else {
                             bot.send_message(msg.chat.id, "Отвечать (свайпать слево) можно только на входящие анонимные сообщения").await?;
                         }
@@ -190,37 +250,18 @@ async fn handle_message(db: Arc<Db>, bot: Bot, msg: Message, dialogue: MyDialogu
                 },
                 State::WaitNewMessage { recipient_id, sent_msg: _ } => {
                     if msg.reply_to_message().is_some() {
-                        bot.send_message(msg.chat.id, "Для отправки анонимного вопроса не нужно свайпать сообщение влево (отвечать).").await?;
+                        bot.send_message(msg.chat.id, "Для отправки анонимного вопроса не нужно свайпать сообщение влево (отвечать)").await?;
                         dialogue.reset().await?;
                     } else {
-                        match bot.send_message(
-                            ChatId(recipient_id),
-                            format!("Вы получили сообщение (свайпните влево для ответа):\n\n{text}"),
-                        )
-                        // .parse_mode(ParseMode::MarkdownV2)
-                        .await {
-                            Ok(sent_msg) => {
-                                bot.send_message(
-                                    msg.chat.id,
-                                    format!("Ваше сообщение успешно отправлено! А вот, кстати, ваша \
-                                    собственная ссылка для получения анонимных вопросов и сообщений: {user_link}",),
-                                )
-                                .await?;
-                                db.save_message(msg.chat.id.0, msg.id.0, recipient_id, sent_msg.id.0).await?;
-                            },
-                            Err(e) => {
-                                bot.send_message(
-                                    msg.chat.id,
-                                    format!(
-                                        "Не удалось отправить сообщение: {e}. \
-                                Возможно, получатель заблокировал бота. А вот, кстати, ваша \
-                                собственная ссылка для получения анонимных вопросов и сообщений: {user_link}"
-                                        ),
-                                    )
-                                    .await?;
-                                sentry::capture_error(&e);
-                            },
-                        };
+                        if let Some(sent_msg) = forward_message(&bot, &msg, ChatId(recipient_id), None).await? {
+                            bot.send_message(
+                                msg.chat.id,
+                                format!("Ваше сообщение отправлено! А вот, кстати, ваша \
+                                    собственная ссылка для получения анонимных вопросов и сообщений: {user_link}")
+                            )
+                            .await?;
+                            db.save_message(msg.chat.id.0, msg.id.0, sent_msg.chat.id.0, sent_msg.id.0).await?;
+                        }
                         dialogue.reset().await?;
                     }
                 }
