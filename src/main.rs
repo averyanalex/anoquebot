@@ -9,7 +9,7 @@ use teloxide::{
     adaptors::{throttle::Limits, Throttle},
     dispatching::dialogue::InMemStorage,
     prelude::*,
-    types::{Chat, InputFile, MessageId},
+    types::{Chat, InputFile, KeyboardButton, KeyboardMarkup, KeyboardRemove, MessageId},
     utils::command::parse_command,
 };
 use tracing::*;
@@ -24,7 +24,6 @@ pub enum State {
     #[default]
     Start,
     WaitNewMessage {
-        sent_msg: i32,
         recipient_id: i64,
     },
 }
@@ -44,9 +43,9 @@ fn main() -> Result<()> {
             ),
         )
         .with(
-            sentry_tracing::layer().event_filter(|md| match *md.level() {
-                Level::TRACE => sentry_tracing::EventFilter::Ignore,
-                _ => sentry_tracing::EventFilter::Breadcrumb,
+            sentry::integrations::tracing::layer().event_filter(|md| match *md.level() {
+                Level::TRACE => sentry::integrations::tracing::EventFilter::Ignore,
+                _ => sentry::integrations::tracing::EventFilter::Breadcrumb,
             }),
         )
         .try_init()
@@ -58,8 +57,10 @@ fn main() -> Result<()> {
                 d,
                 sentry::ClientOptions {
                     release: sentry::release_name!(),
+                    default_integrations: true,
                     attach_stacktrace: true,
-                    traces_sample_rate: 1.0,
+                    send_default_pii: true,
+                    max_breadcrumbs: 300,
                     ..Default::default()
                 },
             ));
@@ -107,11 +108,10 @@ async fn reset_dialogue(bot: &Bot, dialogue: &MyDialogue, chat_id: ChatId) -> Re
     let state = dialogue.get_or_default().await?;
     match state {
         State::Start => {}
-        State::WaitNewMessage {
-            sent_msg,
-            recipient_id: _,
-        } => {
-            bot.delete_message(chat_id, MessageId(sent_msg)).await.ok();
+        State::WaitNewMessage { recipient_id: _ } => {
+            bot.send_message(chat_id, "Отправка сообщения отменена!")
+                .reply_markup(KeyboardRemove::new())
+                .await?;
         }
     };
     dialogue.reset().await?;
@@ -162,6 +162,16 @@ async fn forward_message(
         let mut r = bot.send_voice(recipient, InputFile::file_id(&video_note.file.id));
         prepare_msg!(r);
         r.await?
+    } else if let Some(sticker) = msg.sticker() {
+        let mut r = bot.send_sticker(recipient, InputFile::file_id(&sticker.file.id));
+        if let Some(reply_for) = reply_for {
+            r = r.reply_to_message_id(reply_for.0);
+        }
+        r.await?
+    } else if let Some(animation) = msg.animation() {
+        let mut r = bot.send_animation(recipient, InputFile::file_id(&animation.file.id));
+        prepare_msg!(r);
+        r.await?
     } else if let Some(text) = msg.text() {
         let mut r = bot.send_message(
             recipient,
@@ -174,7 +184,7 @@ async fn forward_message(
     } else {
         bot.send_message(
             msg.chat.id,
-            "Поддерживаются только текст, фото, видео, аудио, файлы, кружочки и голосовые.",
+            "Поддерживаются только текст, фото, видео, стикеры, гифки, аудио, файлы, кружочки и голосовые.",
         )
         .await?;
         return Ok(None);
@@ -186,38 +196,43 @@ async fn forward_message(
 async fn handle_message(db: Arc<Db>, bot: Bot, msg: Message, dialogue: MyDialogue) -> Result<()> {
     try_handle(&msg.chat, &bot, async {
         if let Some(text) = msg.text() && let Some(cmd) = parse_command(text, bot.get_me().await?.username()) {
+            // received command
+            reset_dialogue(&bot, &dialogue, msg.chat.id).await?;
             match cmd.0 {
                 "start" => {
+                    // received start command
                     if let Some(link) = cmd.1.into_iter().next() {
+                        // start command has link
                         if let Some(recipient_id) = db.user_id_by_link(link).await? {
+                            // link is valid
                             db.get_user_link(msg.chat.id.0, Some(recipient_id)).await?;
-                            let sent_msg = bot.send_message(msg.chat.id, "Отправьте ваше анонимное сообщение \
-                            (текст, фото, видео, аудио, файл, кружочек или голосовое):")
+                            bot.send_message(msg.chat.id, "Отправьте ваше анонимное сообщение \
+                            (текст, фото, видео, стикер, гифка, аудио, файл, кружочек или голосовое):")
+                                .reply_markup(KeyboardMarkup::new([[KeyboardButton::new("Отмена")]]).resize_keyboard(true))
                                 .await?;
-                            reset_dialogue(&bot, &dialogue, msg.chat.id).await?;
-                            dialogue.update(State::WaitNewMessage { recipient_id, sent_msg: sent_msg.id.0 }).await?;
+                            dialogue.update(State::WaitNewMessage { recipient_id }).await?;
                         } else {
+                            // link is invalid
                             let my_link_code = db.get_user_link(msg.chat.id.0, None).await?;
                             bot.send_message(
                                 msg.chat.id,
                                 format!("Ссылка недействительна! Попросите автора создать новую ссылку. \
                                 А вот, кстати, ваша собственная ссылка для получения анонимных вопросов и сообщений: {}", user_link(&bot, &my_link_code).await?),
                             )
+                            .reply_markup(KeyboardRemove::new())
                             .await?;
-                            reset_dialogue(&bot, &dialogue, msg.chat.id).await?;
                         }
                     } else {
+                        // no link
                         let my_link_code = db.get_user_link(msg.chat.id.0, None).await?;
                         bot.send_message(msg.chat.id, format!("Добро пожаловать в бот для полученя анонимных вопросов и сообщений! \
-                        Чтобы начать получать анонимные вопросы, поделитесь своей персональной ссылкой с друзьями: {}. Возможна отправка текста, фото, аудио, \
-                        видео, файлов, кружочков и голосовых.", user_link(&bot, &my_link_code).await?)).await?;
-                        reset_dialogue(&bot, &dialogue, msg.chat.id).await?;
+                        Чтобы начать получать анонимные вопросы, поделитесь своей персональной ссылкой с друзьями: {}. Возможна отправка текста, фото, видео, \
+                        стикеров, гифок, аудио, файлов, кружочков и голосовых.", user_link(&bot, &my_link_code).await?)).await?;
                     }
                 }
                 _ => {
                     db.get_user_link(msg.chat.id.0, None).await?;
                     bot.send_message(msg.chat.id, "Неизвестная команда! Попробуйте /start").await?;
-                    reset_dialogue(&bot, &dialogue, msg.chat.id).await?;
                 }
             }
         } else {
@@ -228,40 +243,49 @@ async fn handle_message(db: Arc<Db>, bot: Bot, msg: Message, dialogue: MyDialogu
 
             match state {
                 State::Start => {
+                    // not waiting message
                     if let Some(msg_reply_to) = msg.reply_to_message() {
+                        // user tries to reply
                         ensure!(msg_reply_to.chat.id == msg.chat.id);
-                        if let Some(reply_for) = db.find_message(msg.chat.id.0, msg_reply_to.id.0).await? {
+                        if let Some(reply_for) = db.find_another_message(msg.chat.id.0, msg_reply_to.id.0).await? {
                             if let Some(sent_msg) = forward_message(&bot, &msg, ChatId(reply_for.0), Some(MessageId(reply_for.1))).await? {
+                                db.save_message(msg.chat.id.0, msg.id.0, sent_msg.chat.id.0, sent_msg.id.0).await?;
                                 bot.send_message(
                                     msg.chat.id,
-                                    "Ваш ответ отправлен!"
+                                    "Ваше сообщение отправлено!"
                                 )
+                                .reply_markup(KeyboardRemove::new())
                                 .await?;
-                                db.save_message(msg.chat.id.0, msg.id.0, sent_msg.chat.id.0, sent_msg.id.0).await?;
                             }
                         } else {
-                            bot.send_message(msg.chat.id, "Отвечать (свайпать слево) можно только на входящие анонимные сообщения").await?;
+                            bot.send_message(msg.chat.id, "Отвечать (свайпать слево) можно только на входящие и исходящие анонимные сообщения")
+                                .reply_markup(KeyboardRemove::new())
+                                .await?;
                         }
                     } else {
-                    bot.send_message(msg.chat.id, format!("Кажется, вы отправили сообщение, но мы его не ждали... Может быть, \
-                    вы хотели отправить кому-то сообщение или ответь на полученное? В таком случае перейдите по ссылке друга или свайпните \
-                    полученное сообщение слево. А если вы хотите начать получать сообщения сами, то держите ссылку: {user_link}")).await?;
+                        bot.send_message(msg.chat.id, format!("Кажется, вы отправили сообщение, но мы его не ждали... Может быть, \
+                        вы хотели отправить кому-то сообщение или ответить на полученное? В таком случае перейдите по ссылке друга или свайпните \
+                        полученное сообщение влево. А если вы хотите начать получать сообщения сами, то держите ссылку: {user_link}"))
+                            .reply_markup(KeyboardRemove::new())
+                            .await?;
                     }
                 },
-                State::WaitNewMessage { recipient_id, sent_msg: _ } => {
-                    if msg.reply_to_message().is_some() {
-                        bot.send_message(msg.chat.id, "Для отправки анонимного вопроса не нужно свайпать сообщение влево (отвечать)").await?;
-                        dialogue.reset().await?;
-                    } else {
-                        if let Some(sent_msg) = forward_message(&bot, &msg, ChatId(recipient_id), None).await? {
-                            bot.send_message(
-                                msg.chat.id,
-                                format!("Ваше сообщение отправлено! А вот, кстати, ваша \
-                                    собственная ссылка для получения анонимных вопросов и сообщений: {user_link}")
-                            )
-                            .await?;
-                            db.save_message(msg.chat.id.0, msg.id.0, sent_msg.chat.id.0, sent_msg.id.0).await?;
-                        }
+                State::WaitNewMessage { recipient_id } => {
+                    // waiting message
+                    if let Some(text) = msg.text() && text == "Отмена" {
+                        reset_dialogue(&bot, &dialogue, msg.chat.id).await?;
+                    } else if msg.reply_to_message().is_some() {
+                        bot.send_message(msg.chat.id, "Для отправки анонимного вопроса не нужно свайпать сообщение влево (отвечать). Попробуйте ещё раз, \
+                        отменив отправку вопроса или не отвечая на другие сообщения.").await?;
+                    } else if let Some(sent_msg) = forward_message(&bot, &msg, ChatId(recipient_id), None).await? {
+                        db.save_message(msg.chat.id.0, msg.id.0, sent_msg.chat.id.0, sent_msg.id.0).await?;
+                        bot.send_message(
+                            msg.chat.id,
+                            format!("Ваше сообщение отправлено! А вот, кстати, ваша \
+                                собственная ссылка для получения анонимных вопросов и сообщений: {user_link}")
+                        )
+                        .reply_markup(KeyboardRemove::new())
+                        .await?;
                         dialogue.reset().await?;
                     }
                 }
@@ -295,7 +319,7 @@ async fn try_handle(
     });
 
     if let Err(e) = handle.await {
-        sentry_anyhow::capture_anyhow(&e);
+        sentry::integrations::anyhow::capture_anyhow(&e);
         bot.send_message(chat.id, format!("Произошла неизвестная ошибка: {e}"))
             .await
             .ok();

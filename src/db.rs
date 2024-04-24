@@ -1,6 +1,6 @@
 use anyhow::Result;
 use entities::{messages, prelude::*, users};
-use migration::{Migrator, MigratorTrait};
+use migration::{Migrator, MigratorTrait, SimpleExpr};
 use rand::Rng;
 use sea_orm::{prelude::*, ActiveValue, ConnectOptions, Database, DatabaseConnection, EntityTrait};
 use tracing::log::LevelFilter;
@@ -94,17 +94,30 @@ impl Db {
         Ok(())
     }
 
-    pub async fn find_message(
+    pub async fn find_another_message(
         &self,
-        recipient_id: i64,
-        recipient_message_id: i32,
+        chat_id: i64,
+        msg_id: i32,
     ) -> Result<Option<(i64, i32)>> {
         let ids = Messages::find()
-            .filter(messages::Column::RecipientId.eq(recipient_id))
-            .filter(messages::Column::RecipientMessageId.eq(recipient_message_id))
+            .filter(SimpleExpr::or(
+                messages::Column::RecipientId
+                    .eq(chat_id)
+                    .and(messages::Column::RecipientMessageId.eq(msg_id)),
+                messages::Column::SenderId
+                    .eq(chat_id)
+                    .and(messages::Column::SenderMessageId.eq(msg_id)),
+            ))
             .one(&self.dc)
-            .await?
-            .map(|m| (m.sender_id, m.sender_message_id));
-        Ok(ids)
+            .await?;
+        Ok(if let Some(ids) = ids {
+            if chat_id == ids.recipient_id && msg_id == ids.recipient_message_id {
+                Some((ids.sender_id, ids.sender_message_id))
+            } else {
+                Some((ids.recipient_id, ids.recipient_message_id))
+            }
+        } else {
+            None
+        })
     }
 }
