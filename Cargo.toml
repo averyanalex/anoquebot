@@ -27,7 +27,7 @@ sentry = { version = "0.32", default-features = false, features = [
     "anyhow",
     "tracing",
     "reqwest",
-    "rustls"
+    "rustls",
 ] }
 teloxide = { version = "0.12", features = [
     "ctrlc_handler",

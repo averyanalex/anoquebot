@@ -8,8 +8,12 @@ use sentry::protocol::Value;
 use teloxide::{
     adaptors::{throttle::Limits, Throttle},
     dispatching::dialogue::InMemStorage,
+    payloads::AnswerCallbackQuerySetters,
     prelude::*,
-    types::{Chat, InputFile, KeyboardButton, KeyboardMarkup, KeyboardRemove, MessageId},
+    types::{
+        Chat, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, KeyboardMarkup,
+        KeyboardRemove, MessageId,
+    },
     utils::command::parse_command,
 };
 use tracing::*;
@@ -82,9 +86,13 @@ async fn _main() -> Result<()> {
     tracing::info!("Starting bot...");
     let bot = teloxide::Bot::from_env().throttle(Limits::default());
 
-    let handler = Update::filter_message()
-        .enter_dialogue::<Message, InMemStorage<State>, State>()
-        .branch(dptree::endpoint(handle_message));
+    let handler = dptree::entry()
+        .branch(
+            Update::filter_message()
+                .enter_dialogue::<Message, InMemStorage<State>, State>()
+                .branch(dptree::endpoint(handle_message)),
+        )
+        .branch(Update::filter_callback_query().endpoint(handle_callback_query));
 
     let db = Arc::new(Db::new().await?);
 
@@ -123,72 +131,20 @@ async fn forward_message(
     msg: &Message,
     recipient: ChatId,
     reply_for: Option<MessageId>,
-) -> Result<Option<Message>> {
-    macro_rules! prepare_msg {
-        ($req:ident) => {
-            if let Some(reply_for) = reply_for {
-                $req = $req.reply_to_message_id(reply_for);
-            }
+) -> Result<Option<MessageId>> {
+    let inline_keyboard =
+        InlineKeyboardMarkup::new([[InlineKeyboardButton::callback("Ответить", "reply")]]);
 
-            if let Some(caption) = msg.caption() {
-                $req = $req.caption(format!("Вы получили сообщение (свайпните влево для ответа):\n\n{caption}"));
-            } else {
-                $req = $req.caption("Вы получили сообщение (свайпните влево для ответа)");
-            }
-        };
+    let mut req = bot
+        .copy_message(recipient, msg.chat.id, msg.id)
+        .disable_notification(false)
+        .allow_sending_without_reply(true)
+        .reply_markup(inline_keyboard);
+    if let Some(reply_for) = reply_for {
+        req = req.reply_to_message_id(reply_for);
     }
 
-    let sent_msg = if let Some([.., photo]) = msg.photo() {
-        let mut r = bot.send_photo(recipient, InputFile::file_id(&photo.file.id));
-        prepare_msg!(r);
-        r.await?
-    } else if let Some(video) = msg.video() {
-        let mut r = bot.send_video(recipient, InputFile::file_id(&video.file.id));
-        prepare_msg!(r);
-        r.await?
-    } else if let Some(audio) = msg.audio() {
-        let mut r = bot.send_audio(recipient, InputFile::file_id(&audio.file.id));
-        prepare_msg!(r);
-        r.await?
-    } else if let Some(document) = msg.document() {
-        let mut r = bot.send_document(recipient, InputFile::file_id(&document.file.id));
-        prepare_msg!(r);
-        r.await?
-    } else if let Some(voice) = msg.voice() {
-        let mut r = bot.send_voice(recipient, InputFile::file_id(&voice.file.id));
-        prepare_msg!(r);
-        r.await?
-    } else if let Some(video_note) = msg.video_note() {
-        let mut r = bot.send_voice(recipient, InputFile::file_id(&video_note.file.id));
-        prepare_msg!(r);
-        r.await?
-    } else if let Some(sticker) = msg.sticker() {
-        let mut r = bot.send_sticker(recipient, InputFile::file_id(&sticker.file.id));
-        if let Some(reply_for) = reply_for {
-            r = r.reply_to_message_id(reply_for.0);
-        }
-        r.await?
-    } else if let Some(animation) = msg.animation() {
-        let mut r = bot.send_animation(recipient, InputFile::file_id(&animation.file.id));
-        prepare_msg!(r);
-        r.await?
-    } else if let Some(text) = msg.text() {
-        let mut r = bot.send_message(
-            recipient,
-            format!("Вы получили сообщение (свайпните влево для ответа):\n\n{text}"),
-        );
-        if let Some(reply_for) = reply_for {
-            r = r.reply_to_message_id(reply_for);
-        }
-        r.await?
-    } else {
-        bot.send_message(
-            msg.chat.id,
-            "Поддерживаются только текст, фото, видео, стикеры, гифки, аудио, файлы, кружочки и голосовые.",
-        )
-        .await?;
-        return Ok(None);
-    };
+    let sent_msg = req.await?;
 
     Ok(Some(sent_msg))
 }
@@ -207,7 +163,7 @@ async fn handle_message(db: Arc<Db>, bot: Bot, msg: Message, dialogue: MyDialogu
                             // link is valid
                             db.get_user_link(msg.chat.id.0, Some(recipient_id)).await?;
                             bot.send_message(msg.chat.id, "Отправьте ваше анонимное сообщение \
-                            (текст, фото, видео, стикер, гифка, аудио, файл, кружочек или голосовое):")
+                            (поддерживаются любые типы сообщений):")
                                 .reply_markup(KeyboardMarkup::new([[KeyboardButton::new("Отмена")]]).resize_keyboard(true))
                                 .await?;
                             dialogue.update(State::WaitNewMessage { recipient_id }).await?;
@@ -226,8 +182,7 @@ async fn handle_message(db: Arc<Db>, bot: Bot, msg: Message, dialogue: MyDialogu
                         // no link
                         let my_link_code = db.get_user_link(msg.chat.id.0, None).await?;
                         bot.send_message(msg.chat.id, format!("Добро пожаловать в бот для полученя анонимных вопросов и сообщений! \
-                        Чтобы начать получать анонимные вопросы, поделитесь своей персональной ссылкой с друзьями: {}. Возможна отправка текста, фото, видео, \
-                        стикеров, гифок, аудио, файлов, кружочков и голосовых.", user_link(&bot, &my_link_code).await?)).await?;
+                        Чтобы начать получать анонимные вопросы, поделитесь своей персональной ссылкой с друзьями: {}. Возможна отправка любых типов сообщений.", user_link(&bot, &my_link_code).await?)).await?;
                     }
                 }
                 _ => {
@@ -248,8 +203,8 @@ async fn handle_message(db: Arc<Db>, bot: Bot, msg: Message, dialogue: MyDialogu
                         // user tries to reply
                         ensure!(msg_reply_to.chat.id == msg.chat.id);
                         if let Some(reply_for) = db.find_another_message(msg.chat.id.0, msg_reply_to.id.0).await? {
-                            if let Some(sent_msg) = forward_message(&bot, &msg, ChatId(reply_for.0), Some(MessageId(reply_for.1))).await? {
-                                db.save_message(msg.chat.id.0, msg.id.0, sent_msg.chat.id.0, sent_msg.id.0).await?;
+                            if let Some(sent_msg_id) = forward_message(&bot, &msg, ChatId(reply_for.0), Some(MessageId(reply_for.1))).await? {
+                                db.save_message(msg.chat.id.0, msg.id.0, reply_for.0, sent_msg_id.0).await?;
                                 bot.send_message(
                                     msg.chat.id,
                                     "Ваше сообщение отправлено!"
@@ -277,8 +232,8 @@ async fn handle_message(db: Arc<Db>, bot: Bot, msg: Message, dialogue: MyDialogu
                     } else if msg.reply_to_message().is_some() {
                         bot.send_message(msg.chat.id, "Для отправки анонимного вопроса не нужно свайпать сообщение влево (отвечать). Попробуйте ещё раз, \
                         отменив отправку вопроса или не отвечая на другие сообщения.").await?;
-                    } else if let Some(sent_msg) = forward_message(&bot, &msg, ChatId(recipient_id), None).await? {
-                        db.save_message(msg.chat.id.0, msg.id.0, sent_msg.chat.id.0, sent_msg.id.0).await?;
+                    } else if let Some(sent_msg_id) = forward_message(&bot, &msg, ChatId(recipient_id), None).await? {
+                        db.save_message(msg.chat.id.0, msg.id.0, recipient_id, sent_msg_id.0).await?;
                         bot.send_message(
                             msg.chat.id,
                             format!("Ваше сообщение отправлено! А вот, кстати, ваша \
@@ -294,6 +249,14 @@ async fn handle_message(db: Arc<Db>, bot: Bot, msg: Message, dialogue: MyDialogu
         Ok(())
     })
     .await
+}
+
+async fn handle_callback_query(bot: Bot, q: CallbackQuery) -> Result<()> {
+    bot.answer_callback_query(q.id)
+        .cache_time(3600)
+        .text("Ответьте (свайпните влево) это сообщение для ответа")
+        .await?;
+    Ok(())
 }
 
 async fn try_handle(
