@@ -44,4 +44,5 @@ pub enum Users {
     Link,
     LastActivity,
     FirstActivity,
+    AnswerTip,
 }

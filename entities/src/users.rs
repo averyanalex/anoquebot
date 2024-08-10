@@ -12,6 +12,7 @@ pub struct Model {
     #[sea_orm(unique)]
     pub link: String,
     pub first_activity: DateTime,
+    pub answer_tip: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

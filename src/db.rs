@@ -1,9 +1,11 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use entities::{messages, prelude::*, users};
 use migration::{Migrator, MigratorTrait, SimpleExpr};
 use rand::Rng;
 use sea_orm::{prelude::*, ActiveValue, ConnectOptions, Database, DatabaseConnection, EntityTrait};
 use tracing::log::LevelFilter;
+
+use crate::UserLink;
 
 pub struct Db {
     dc: DatabaseConnection,
@@ -22,7 +24,7 @@ impl Db {
         Ok(Self { dc })
     }
 
-    pub async fn get_user_link(&self, id: i64, invited_by: Option<i64>) -> Result<String> {
+    pub async fn get_user_link(&self, id: i64, invited_by: Option<i64>) -> Result<UserLink> {
         let link = if let Some(user) = Users::find_by_id(id).one(&self.dc).await? {
             Users::update_many()
                 .col_expr(
@@ -54,18 +56,8 @@ impl Db {
             Users::insert(user).exec(&self.dc).await?;
             link
         };
-        Ok(link)
+        Ok(UserLink(link))
     }
-
-    // pub async fn set_invited_by(&self, id: i64, invited_by: i64) -> Result<()> {
-    //     Users::update_many()
-    //         .col_expr(users::Column::InvitedBy, invited_by.into())
-    //         .filter(users::Column::Id.eq(id))
-    //         .filter(users::Column::InvitedBy.is_null())
-    //         .exec(&self.dc)
-    //         .await?;
-    //     Ok(())
-    // }
 
     pub async fn user_id_by_link(&self, link: &str) -> Result<Option<i64>> {
         let id = Users::find()
@@ -119,5 +111,22 @@ impl Db {
         } else {
             None
         })
+    }
+
+    pub async fn disable_answer_tip(&self, user_id: i64) -> Result<()> {
+        Users::update_many()
+            .col_expr(users::Column::AnswerTip, Expr::value(false))
+            .filter(users::Column::Id.eq(user_id))
+            .exec(&self.dc)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn answer_tip_enabled(&self, user_id: i64) -> Result<bool> {
+        let user = Users::find_by_id(user_id)
+            .one(&self.dc)
+            .await?
+            .context("user not found")?;
+        Ok(user.answer_tip)
     }
 }

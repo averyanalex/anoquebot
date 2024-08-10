@@ -29,7 +29,7 @@ sentry = { version = "0.32", default-features = false, features = [
     "reqwest",
     "rustls",
 ] }
-teloxide = { version = "0.12", features = [
+teloxide = { version = "0.12.2", features = [
     "ctrlc_handler",
     "throttle",
     "macros",
