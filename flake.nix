@@ -86,6 +86,11 @@
           default = pkgs.mkShell {
             buildInputs = devInputs ++ buildInputs ++ nativeBuildInputs;
 
+            LD_LIBRARY_PATH = "${
+              pkgs.lib.makeLibraryPath
+              buildInputs
+            }";
+
             shellHook = ''
               export PGDATA=$PWD/postgres/data
               export PGHOST=$PWD/postgres

@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use entities::{messages, prelude::*, users};
 use migration::{Migrator, MigratorTrait, SimpleExpr};
 use rand::Rng;
-use sea_orm::{prelude::*, ActiveValue, ConnectOptions, Database, DatabaseConnection, EntityTrait};
+use sea_orm::{
+    prelude::*, ActiveValue, ConnectOptions, Database, DatabaseConnection, EntityTrait,
+    FromQueryResult, QuerySelect, SelectColumns,
+};
 use tracing::log::LevelFilter;
 
 use crate::UserLink;
@@ -128,5 +131,21 @@ impl Db {
             .await?
             .context("user not found")?;
         Ok(user.answer_tip)
+    }
+
+    pub async fn get_all_users(&self) -> Result<Vec<i64>> {
+        #[derive(FromQueryResult)]
+        struct UserWithId {
+            id: i64,
+        }
+
+        let users = Users::find()
+            .select_only()
+            .select_column(users::Column::Id)
+            .into_model::<UserWithId>()
+            .all(&self.dc)
+            .await?;
+
+        Ok(users.into_iter().map(|u| u.id).collect())
     }
 }

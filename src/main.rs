@@ -3,17 +3,16 @@
 use std::{str::FromStr, sync::Arc};
 
 use anyhow::{ensure, Context, Result};
-use db::Db;
 use dptree::case;
 use teloxide::{
-    adaptors::{throttle::Limits, Throttle},
+    adaptors::{throttle::Limits, CacheMe, Throttle},
     dispatching::dialogue::{GetChatId, InMemStorage},
     macros::BotCommands,
-    payloads::AnswerCallbackQuerySetters,
+    payloads::{AnswerCallbackQuerySetters, CopyMessageSetters},
     prelude::*,
     types::{
-        InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, KeyboardMarkup, KeyboardRemove,
-        Me, MessageId,
+        InlineKeyboardButton, InlineKeyboardMarkup, KeyboardRemove, Me, MessageId, ReactionType,
+        ReplyParameters,
     },
     utils::command::BotCommands as _,
 };
@@ -22,17 +21,22 @@ use tracing_subscriber::prelude::*;
 
 mod db;
 
-type Bot = Throttle<teloxide::Bot>;
+use db::Db;
+
+#[derive(Clone)]
+pub struct WaitNewMessage {
+    recipient_id: i64,
+    clear_markup_message_id: i32,
+}
 
 #[derive(Clone, Default)]
 pub enum State {
     #[default]
     Start,
-    WaitNewMessage {
-        recipient_id: i64,
-    },
+    WaitNewMessage(WaitNewMessage),
 }
 
+type Bot = CacheMe<Throttle<teloxide::Bot>>;
 type MyDialogue = Dialogue<State, InMemStorage<State>>;
 
 #[derive(Clone)]
@@ -102,7 +106,9 @@ fn main() -> Result<()> {
 }
 
 async fn _main() -> Result<()> {
-    let bot = teloxide::Bot::from_env().throttle(Limits::default());
+    let bot = teloxide::Bot::from_env()
+        .throttle(Limits::default())
+        .cache_me();
 
     let command_handler = teloxide::filter_command::<Command, _>()
         .branch(case![Command::Start(link)].endpoint(handle_command_start));
@@ -114,7 +120,7 @@ async fn _main() -> Result<()> {
                 .await
                 .unwrap_or(UserLink("ERROR".to_owned()))
         })
-        .branch(case![State::WaitNewMessage { recipient_id }].endpoint(handle_state_wait))
+        .branch(case![State::WaitNewMessage(wait_new_message)].endpoint(handle_state_wait))
         .branch(dptree::endpoint(handle_state_start));
 
     let callback_handler = Update::filter_callback_query().endpoint(handle_callback_query);
@@ -142,20 +148,6 @@ async fn _main() -> Result<()> {
     Ok(())
 }
 
-async fn reset_dialogue(bot: &Bot, dialogue: &MyDialogue, chat_id: ChatId) -> Result<()> {
-    let state = dialogue.get_or_default().await?;
-    match state {
-        State::Start => {}
-        State::WaitNewMessage { recipient_id: _ } => {
-            bot.send_message(chat_id, "Отправка сообщения отменена!")
-                .reply_markup(KeyboardRemove::new())
-                .await?;
-        }
-    };
-    dialogue.reset().await?;
-    Ok(())
-}
-
 async fn forward_message(
     bot: &Bot,
     db: &Db,
@@ -165,9 +157,7 @@ async fn forward_message(
 ) -> Result<MessageId> {
     let mut req = bot
         .copy_message(recipient, msg.chat.id, msg.id)
-        .disable_notification(false)
-        .allow_sending_without_reply(true);
-
+        .disable_notification(false);
     if db.answer_tip_enabled(recipient.0).await? {
         let inline_keyboard =
             InlineKeyboardMarkup::new([[InlineKeyboardButton::callback("Ответить", "reply")]]);
@@ -175,7 +165,7 @@ async fn forward_message(
     }
 
     if let Some(reply_for) = reply_for {
-        req = req.reply_to_message_id(reply_for);
+        req = req.reply_parameters(ReplyParameters::new(reply_for).allow_sending_without_reply());
     }
 
     Ok(req.await?)
@@ -189,23 +179,35 @@ async fn handle_command_start(
     db: Arc<Db>,
     dialogue: MyDialogue,
 ) -> Result<()> {
-    reset_dialogue(&bot, &dialogue, msg.chat.id).await?;
-
     if link.is_empty() {
         let my_link_code = db.get_user_link(msg.chat.id.0, None).await?;
-        bot.send_message(msg.chat.id, format!("Добро пожаловать! \
-        Чтобы начать получать анонимные вопросы, поделитесь своей персональной ссылкой с друзьями: {}. \
-        Возможна отправка любых типов сообщений: текстовых, фото, стикеров и прочих.", my_link_code.tme_url(&me))).await?;
-    } else if let Some(recipient_id) = db.user_id_by_link(&link).await? {
-        db.get_user_link(msg.chat.id.0, Some(recipient_id)).await?;
         bot.send_message(
             msg.chat.id,
-            "Отправьте ваше анонимное сообщение (поддерживаются любые типы сообщений):",
+            format!(
+                "Добро пожаловать! \
+        Чтобы начать получать анонимные вопросы, опубликуйте свою личную ссылку в канале: {}. \
+        Возможна отправка любых сообщений: текстовых, фото, стикеров и прочих.",
+                my_link_code.tme_url(&me)
+            ),
         )
-        .reply_markup(KeyboardMarkup::new([[KeyboardButton::new("Отмена")]]).resize_keyboard(true))
         .await?;
+    } else if let Some(recipient_id) = db.user_id_by_link(&link).await? {
+        db.get_user_link(msg.chat.id.0, Some(recipient_id)).await?;
+        let sent_msg = bot
+            .send_message(
+                msg.chat.id,
+                "Отправьте ваше анонимное сообщение (что угодно - текст, фото, стикер, ...):",
+            )
+            .reply_markup(InlineKeyboardMarkup::new([[
+                InlineKeyboardButton::callback("Отмена", "cancel"),
+            ]]))
+            .await?;
+
         dialogue
-            .update(State::WaitNewMessage { recipient_id })
+            .update(State::WaitNewMessage(WaitNewMessage {
+                recipient_id,
+                clear_markup_message_id: sent_msg.id.0,
+            }))
             .await?;
     } else {
         let my_link_code = db.get_user_link(msg.chat.id.0, None).await?;
@@ -227,30 +229,59 @@ async fn handle_state_start(
     user_link: UserLink,
     me: Me,
 ) -> Result<()> {
-    if let Some(msg_reply_to) = msg.reply_to_message() {
-        ensure!(msg_reply_to.chat.id == msg.chat.id);
-        if let Some(reply_for) = db
-            .find_another_message(msg.chat.id.0, msg_reply_to.id.0)
-            .await?
-        {
-            match forward_message(
-                &bot,
-                &db,
-                &msg,
-                ChatId(reply_for.0),
-                Some(MessageId(reply_for.1)),
-            )
-            .await
-            {
-                Ok(sent_msg_id) => {
-                    db.save_message(msg.chat.id.0, msg.id.0, reply_for.0, sent_msg_id.0)
-                        .await?;
-                    bot.send_message(msg.chat.id, "Ваше сообщение отправлено!")
-                        .reply_markup(KeyboardRemove::new())
-                        .await?;
+    if msg.chat.id == ChatId(1004106925) {
+        if let Some(text) = msg.text() {
+            if let Some(broadcast_msg) = text.strip_prefix("/broadcast ") {
+                for user in db.get_all_users().await? {
+                    if let Err(e) = bot.send_message(ChatId(user), broadcast_msg).await {
+                        bot.send_message(msg.chat.id, e.to_string()).await?;
+                    };
                 }
-                Err(e) => {
-                    bot.send_message(
+                bot.send_message(msg.chat.id, "Done!").await?;
+                return Ok(());
+            }
+        }
+    }
+
+    if let Some(msg_reply_to) = msg.reply_to_message() {
+        process_reply(&db, &bot, msg_reply_to, &msg).await?;
+    } else {
+        bot.send_message(msg.chat.id, format!("Кажется, вы отправили сообщение, но мы его не ждали... Может быть, \
+        вы хотели отправить кому-то сообщение или ответить на полученное? В таком случае перейдите по ссылке друга или свайпните \
+        полученное/отправленное сообщение влево (ответьте). А если вы хотите начать получать сообщения сами, то держите ссылку: {}", user_link.tme_url(&me)))
+            .reply_markup(KeyboardRemove::new())
+            .await?;
+    }
+    Ok(())
+}
+
+async fn process_reply(db: &Db, bot: &Bot, msg_reply_to: &Message, msg: &Message) -> Result<()> {
+    ensure!(msg_reply_to.chat.id == msg.chat.id);
+
+    if let Some(reply_for) = db
+        .find_another_message(msg.chat.id.0, msg_reply_to.id.0)
+        .await?
+    {
+        match forward_message(
+            bot,
+            db,
+            msg,
+            ChatId(reply_for.0),
+            Some(MessageId(reply_for.1)),
+        )
+        .await
+        {
+            Ok(sent_msg_id) => {
+                db.save_message(msg.chat.id.0, msg.id.0, reply_for.0, sent_msg_id.0)
+                    .await?;
+                bot.set_message_reaction(msg.chat.id, msg.id)
+                    .reaction([ReactionType::Emoji {
+                        emoji: "👌".into()
+                    }])
+                    .await?;
+            }
+            Err(e) => {
+                bot.send_message(
                         msg.chat.id,
                         format!(
                             "Не удалось ответить на сообщение: {e}. Возможно, получатель заблокировал бота.",
@@ -258,23 +289,17 @@ async fn handle_state_start(
                     )
                     .reply_markup(KeyboardRemove::new())
                     .await?;
-                }
-            };
-        } else {
-            bot.send_message(
-                msg.chat.id,
-                "Отвечать (свайпать слево) можно только на входящие и исходящие сообщения.",
-            )
-            .reply_markup(KeyboardRemove::new())
-            .await?;
-        }
+            }
+        };
     } else {
-        bot.send_message(msg.chat.id, format!("Кажется, вы отправили сообщение, но мы его не ждали... Может быть, \
-        вы хотели отправить кому-то сообщение или ответить на полученное? В таком случае перейдите по ссылке друга или свайпните \
-        полученное сообщение влево. А если вы хотите начать получать сообщения сами, то держите ссылку: {}", user_link.tme_url(&me)))
-            .reply_markup(KeyboardRemove::new())
-            .await?;
-    }
+        bot.send_message(
+            msg.chat.id,
+            "Отвечать (свайпать слево) можно только на полученные и отправленные сообщения!",
+        )
+        .reply_markup(KeyboardRemove::new())
+        .await?;
+    };
+
     Ok(())
 }
 
@@ -285,27 +310,27 @@ async fn handle_state_wait(
     user_link: UserLink,
     me: Me,
     dialogue: MyDialogue,
-    recipient_id: i64,
+    wait_state: WaitNewMessage,
 ) -> Result<()> {
-    if let Some(text) = msg.text()
-        && text == "Отмена"
-    {
-        reset_dialogue(&bot, &dialogue, msg.chat.id).await?;
-    } else if msg.reply_to_message().is_some() {
+    if msg.reply_to_message().is_some() {
         bot.send_message(
             msg.chat.id,
-            "Для отправки анонимного вопроса не нужно свайпать сообщение влево (отвечать). \
-        Попробуйте ещё раз, отменив отправку вопроса или не отвечая на другие сообщения.",
+            "Вы ответили на сообщение, пока мы ждали отправку вопроса.",
         )
         .reply_markup(InlineKeyboardMarkup::new([[
             InlineKeyboardButton::callback("Отмена", "cancel"),
         ]]))
         .await?;
     } else {
-        match forward_message(&bot, &db, &msg, ChatId(recipient_id), None).await {
+        match forward_message(&bot, &db, &msg, ChatId(wait_state.recipient_id), None).await {
             Ok(sent_msg_id) => {
-                db.save_message(msg.chat.id.0, msg.id.0, recipient_id, sent_msg_id.0)
-                    .await?;
+                db.save_message(
+                    msg.chat.id.0,
+                    msg.id.0,
+                    wait_state.recipient_id,
+                    sent_msg_id.0,
+                )
+                .await?;
                 bot.send_message(
                     msg.chat.id,
                     format!(
@@ -330,6 +355,8 @@ async fn handle_state_wait(
                 .await?;
             }
         }
+        bot.edit_message_reply_markup(msg.chat.id, MessageId(wait_state.clear_markup_message_id))
+            .await?;
         dialogue.reset().await?;
     }
 
@@ -347,8 +374,25 @@ async fn handle_callback_query(
     {
         match data.as_str() {
             "cancel" => {
-                reset_dialogue(&bot, &dialogue, chat_id).await?;
-                bot.edit_message_reply_markup(chat_id, q.message.context("no message")?.id)
+                let state = dialogue.get_or_default().await?;
+                match state {
+                    State::Start => {}
+                    State::WaitNewMessage { .. } => {
+                        let link_code = db.get_user_link(chat_id.0, None).await?;
+                        bot.send_message(
+                            chat_id,
+                            format!(
+                                "Отправка сообщения отменена! А вот, кстати, ваша \
+                        собственная ссылка для получения анонимных вопросов и сообщений: {}",
+                                link_code.tme_url(&bot.get_me().await?)
+                            ),
+                        )
+                        .reply_markup(KeyboardRemove::new())
+                        .await?;
+                    }
+                };
+                dialogue.reset().await?;
+                bot.edit_message_reply_markup(chat_id, q.message.context("no message")?.id())
                     .await?;
                 bot.answer_callback_query(q.id).await?;
             }
@@ -360,6 +404,7 @@ async fn handle_callback_query(
                     .await?;
                 bot.send_message(chat_id, "Для ответа используйте встроенную в Telegram функцию ответа на сообщение (свайпните влево).\n\n\
                     Эта подсказка больше не будет отображаться.")
+                    .reply_markup(KeyboardRemove::new())
                     .await?;
                 db.disable_answer_tip(chat_id.0).await?;
             }
